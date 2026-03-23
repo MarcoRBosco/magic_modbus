@@ -30,6 +30,7 @@ pub enum Action {
     Disconnect,
     Error(String),
     PageRefresh,
+    HoldingRegisterAutoRead,
 }
 
 pub enum ModbusCommandQueue {

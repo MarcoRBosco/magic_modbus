@@ -123,6 +123,7 @@ pub struct App {
     // Misc Statuses
     page_refresh: bool, // Reads the page every time you change pages
     tick_refresh: bool, // Reads the page every tick
+    holding_register_auto_read_suppressed: bool, // Suppressed during writes
     help_menu_page: u8,
     exit: bool,
 }
@@ -201,6 +202,7 @@ impl App {
             // Misc Statuses
             page_refresh: false,
             tick_refresh: false,
+            holding_register_auto_read_suppressed: false,
             help_menu_page: 0,
             exit: false,
         }
@@ -226,6 +228,11 @@ impl App {
             let mut reader = EventStream::new();
             let mut tick_interval = tokio::time::interval(Duration::from_secs(1));
             let mut render_interval = tokio::time::interval(Duration::from_secs_f64(1.0 / 60.0));
+            // Auto-read holding registers every 500 ms; start after the first period
+            let holding_reg_start =
+                tokio::time::Instant::now() + Duration::from_millis(500);
+            let mut holding_reg_interval =
+                tokio::time::interval_at(holding_reg_start, Duration::from_millis(500));
 
             loop {
                 tokio::select! {
@@ -248,6 +255,9 @@ impl App {
                     },
                     _ = render_interval.tick() => {
                         let _ = event_sender.send(Action::Render).await;
+                    },
+                    _ = holding_reg_interval.tick() => {
+                        let _ = event_sender.send(Action::HoldingRegisterAutoRead).await;
                     }
                 }
             }
@@ -282,6 +292,11 @@ impl App {
                         terminal.draw(|frame| self.render(frame))?;
                     }
                     Action::ToModbus(queue) => {
+                        // Suppress auto-reads while a write is in flight so they
+                        // don't race with the write or overwrite the just-sent value.
+                        if matches!(queue, ModbusCommandQueue::Write(_)) {
+                            self.holding_register_auto_read_suppressed = true;
+                        }
                         let _ = self.modbus_sender.send(queue).await;
                     }
                     Action::FromModbus(queue) => {
@@ -294,6 +309,7 @@ impl App {
                         self.connection_status = ConnectionStatus::NotConnected;
                         self.current_ip_address = None;
                         self.current_port = None;
+                        self.holding_register_auto_read_suppressed = false;
 
                         self.app_mode = AppMode::Popup(PopupType::Error(message));
                     }
@@ -309,7 +325,14 @@ impl App {
                         }
                     }
                     Action::SuccessfulWrite => {
+                        // Resume the periodic auto-read now that the write is done.
+                        self.holding_register_auto_read_suppressed = false;
                         self.table_apply_queued_cells();
+                    }
+                    Action::HoldingRegisterAutoRead => {
+                        if !self.holding_register_auto_read_suppressed {
+                            self.modbus_auto_read_holding_registers().await;
+                        }
                     }
                 },
                 None => {
@@ -587,6 +610,7 @@ impl App {
         self.current_serial_port = None;
         self.current_baud_rate = None;
         self.current_slave_id = None;
+        self.holding_register_auto_read_suppressed = false;
     }
 
     async fn on_crossterm_event(&mut self, event: Event) -> Result<()> {
@@ -2359,6 +2383,21 @@ impl App {
         }
     }
 
+    /// Periodically called every 500 ms to keep holding register values fresh.
+    /// Only sends a read — never writes, so queued user edits are not affected.
+    async fn modbus_auto_read_holding_registers(&mut self) {
+        if let ConnectionStatus::Connected = self.connection_status {
+            let table = &self.tables[SelectedTopTab::HoldingRegisters as usize];
+            let amount = (table.table_rows * table.table_cols) as u16;
+            let start = table.table_address / amount * amount;
+            let command: Vec<ModbusReadCommand> =
+                vec![(SelectedTopTab::HoldingRegisters, start, amount)];
+            let _ = self
+                .sender
+                .send(Action::ToModbus(ModbusCommandQueue::Read(command)))
+                .await;
+        }
+    }
     fn next_top_tab(&mut self) {
         self.selected_top_tab = self.selected_top_tab.next();
     }
