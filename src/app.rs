@@ -13,6 +13,7 @@
 //!    limitations under the License.
 
 use std::{
+    env, fs,
     io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
@@ -58,6 +59,17 @@ const FOOTER_TEXT: [&str; 7] = [
     "Enter address (1-65535) | (Enter) Go To Address | (Esc) Cancel",       // Goto Popup
     "(↑ ↓) Scroll | (C) Clear Log",                                         // Log Menu
 ];
+
+const LAST_CONNECTION_FILE: &str = ".magic_modbus_last_connection";
+
+enum LastConnectionConfig {
+    Tcp { ip: Ipv4Addr, port: u16 },
+    Rtu {
+        port: String,
+        baud_rate: u32,
+        slave_id: u8,
+    },
+}
 
 fn make_log_entry(direction: LogDirection, message: String) -> Action {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -152,6 +164,49 @@ pub struct App {
 
 impl App {
     pub fn new() -> App {
+        let loaded_connection = App::load_last_connection_config();
+        let (
+            current_ip_address,
+            current_port,
+            current_serial_port,
+            current_baud_rate,
+            current_slave_id,
+            connect_type,
+            connecting_popup_field,
+        ) = match loaded_connection {
+            Some(LastConnectionConfig::Tcp { ip, port }) => (
+                Some(ip),
+                Some(port),
+                None,
+                None,
+                None,
+                ConnectType::Tcp,
+                ConnectingField::Address,
+            ),
+            Some(LastConnectionConfig::Rtu {
+                port,
+                baud_rate,
+                slave_id,
+            }) => (
+                None,
+                None,
+                Some(port),
+                Some(baud_rate),
+                Some(slave_id),
+                ConnectType::Rtu,
+                ConnectingField::SerialPort,
+            ),
+            None => (
+                None,
+                None,
+                None,
+                None,
+                None,
+                ConnectType::default(),
+                ConnectingField::Address,
+            ),
+        };
+
         let (sender, receiver) = mpsc::channel::<Action>(100);
         let (dummy_tx, _dummy_rx) = mpsc::channel::<ModbusCommandQueue>(1);
         App {
@@ -167,11 +222,11 @@ impl App {
 
             // Networking
             connection_status: ConnectionStatus::default(),
-            current_ip_address: None,
-            current_port: None,
-            current_serial_port: None,
-            current_baud_rate: None,
-            current_slave_id: None,
+            current_ip_address,
+            current_port,
+            current_serial_port,
+            current_baud_rate,
+            current_slave_id,
             selected_connection_button: SelectedConnectionButton::NewConnection,
 
             // UI Focus
@@ -201,8 +256,8 @@ impl App {
             log_scroll_position: 0,
 
             // Connection Popup
-            connect_type: ConnectType::default(),
-            connecting_popup_field: ConnectingField::Address,
+            connect_type,
+            connecting_popup_field,
             address_input: String::from(" "),
             port_input: String::from(" "),
             address_input_cursor: 0,
@@ -231,6 +286,84 @@ impl App {
             tick_refresh: false,
             help_menu_page: 0,
             exit: false,
+        }
+    }
+
+    fn last_connection_config_path() -> Option<std::path::PathBuf> {
+        env::current_dir()
+            .ok()
+            .map(|dir| dir.join(LAST_CONNECTION_FILE))
+    }
+
+    fn load_last_connection_config() -> Option<LastConnectionConfig> {
+        let file_path = Self::last_connection_config_path()?;
+        let contents = fs::read_to_string(file_path).ok()?;
+
+        let mut mode: Option<String> = None;
+        let mut ip: Option<Ipv4Addr> = None;
+        let mut tcp_port: Option<u16> = None;
+        let mut serial_port: Option<String> = None;
+        let mut baud_rate: Option<u32> = None;
+        let mut slave_id: Option<u8> = None;
+
+        for line in contents.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((raw_key, raw_value)) = line.split_once('=') else {
+                continue;
+            };
+
+            let key = raw_key.trim();
+            let value = raw_value.trim();
+
+            match key {
+                "mode" => mode = Some(value.to_lowercase()),
+                "ip" => ip = value.parse::<Ipv4Addr>().ok(),
+                "port" => tcp_port = value.parse::<u16>().ok(),
+                "serial_port" => serial_port = Some(value.to_owned()),
+                "baud_rate" => baud_rate = value.parse::<u32>().ok(),
+                "slave_id" => slave_id = value.parse::<u8>().ok(),
+                _ => {}
+            }
+        }
+
+        match mode.as_deref() {
+            Some("rtu") => Some(LastConnectionConfig::Rtu {
+                port: serial_port?,
+                baud_rate: baud_rate?,
+                slave_id: slave_id?,
+            }),
+            Some("tcp") => Some(LastConnectionConfig::Tcp {
+                ip: ip?,
+                port: tcp_port?,
+            }),
+            _ => None,
+        }
+    }
+
+    fn save_last_connection_config(&self) {
+        let contents = if let (Some(serial_port), Some(baud_rate), Some(slave_id)) = (
+            self.current_serial_port.as_ref(),
+            self.current_baud_rate,
+            self.current_slave_id,
+        ) {
+            format!(
+                "mode=rtu\nserial_port={}\nbaud_rate={}\nslave_id={}\n",
+                serial_port, baud_rate, slave_id
+            )
+        } else if let (Some(ip), Some(port)) = (self.current_ip_address, self.current_port) {
+            format!("mode=tcp\nip={}\nport={}\n", ip, port)
+        } else {
+            return;
+        };
+
+        let Some(file_path) = Self::last_connection_config_path() else {
+            return;
+        };
+
+        if let Ok(mut file) = fs::File::create(file_path) {
+            let _ = file.write_all(contents.as_bytes());
         }
     }
 
@@ -321,10 +454,11 @@ impl App {
                         }
                     }
                     Action::Connect(mode) => self.start_modbus_task(mode).await?,
+                    Action::ConnectionEstablished => {
+                        self.save_last_connection_config();
+                    }
                     Action::ConnectionError(message) => {
                         self.connection_status = ConnectionStatus::NotConnected;
-                        self.current_ip_address = None;
-                        self.current_port = None;
 
                         self.app_mode = AppMode::Popup(PopupType::Error(message));
                     }
@@ -435,6 +569,9 @@ impl App {
                     }
                 }
             };
+
+            let _ = ui_tx.send(Action::ConnectionEstablished).await;
+
             while let Some(queue) = rx_from_ui.recv().await {
                 match queue {
                     ModbusCommandQueue::Read(commands) => {
@@ -802,11 +939,30 @@ impl App {
         self.modbus_sender = dummy_tx;
 
         self.connection_status = ConnectionStatus::NotConnected;
-        self.current_ip_address = None;
-        self.current_port = None;
-        self.current_serial_port = None;
-        self.current_baud_rate = None;
-        self.current_slave_id = None;
+    }
+
+    fn set_connection_popup_inputs_from_memory(&mut self) {
+        if let (Some(serial_port), Some(baud_rate), Some(slave_id)) = (
+            self.current_serial_port.as_ref(),
+            self.current_baud_rate,
+            self.current_slave_id,
+        ) {
+            self.connect_type = ConnectType::Rtu;
+            self.connecting_popup_field = ConnectingField::SerialPort;
+            self.serial_port_input = format!("{serial_port} ");
+            self.serial_port_input_cursor = self.serial_port_input.len().saturating_sub(1);
+            self.baud_rate_input = format!("{baud_rate} ");
+            self.baud_rate_input_cursor = self.baud_rate_input.len().saturating_sub(1);
+            self.slave_id_input = format!("{slave_id} ");
+            self.slave_id_input_cursor = self.slave_id_input.len().saturating_sub(1);
+        } else if let (Some(ip), Some(port)) = (self.current_ip_address, self.current_port) {
+            self.connect_type = ConnectType::Tcp;
+            self.connecting_popup_field = ConnectingField::Address;
+            self.address_input = format!("{ip} ");
+            self.address_input_cursor = self.address_input.len().saturating_sub(1);
+            self.port_input = format!("{port} ");
+            self.port_input_cursor = self.port_input.len().saturating_sub(1);
+        }
     }
 
     async fn on_crossterm_event(&mut self, event: Event) -> Result<()> {
@@ -936,6 +1092,7 @@ impl App {
                                         }
                                         KeyCode::Enter => match self.selected_connection_button {
                                             SelectedConnectionButton::NewConnection => {
+                                                self.set_connection_popup_inputs_from_memory();
                                                 self.app_mode =
                                                     AppMode::Popup(PopupType::Connection);
                                             }
@@ -1096,12 +1253,6 @@ impl App {
                                         match address {
                                             Ok(addr) => {
                                                 self.app_mode = AppMode::Main;
-                                                self.address_input = String::from(" ");
-                                                self.address_input_cursor = 0;
-                                                self.port_input = String::from(" ");
-                                                self.port_input_cursor = 0;
-                                                self.connecting_popup_field =
-                                                    ConnectingField::Address;
                                                 self.sender
                                                     .send(Action::Connect(ConnectMode::Tcp(addr)))
                                                     .await?;
@@ -1118,14 +1269,6 @@ impl App {
                                     match (port.is_empty(), baud_rate, slave_id) {
                                         (false, Ok(baud_rate), Ok(slave_id)) => {
                                             self.app_mode = AppMode::Main;
-                                            self.serial_port_input = String::from(" ");
-                                            self.serial_port_input_cursor = 0;
-                                            self.baud_rate_input = String::from(" ");
-                                            self.baud_rate_input_cursor = 0;
-                                            self.slave_id_input = String::from(" ");
-                                            self.slave_id_input_cursor = 0;
-                                            self.connecting_popup_field =
-                                                ConnectingField::SerialPort;
                                             self.sender
                                                 .send(Action::Connect(ConnectMode::Rtu {
                                                     port,

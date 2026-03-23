@@ -46,6 +46,7 @@ pub enum Action {
     FromModbus(ModbusCommandQueue), // From Modbus to App
     SuccessfulWrite,
     Connect(ConnectMode),
+    ConnectionEstablished,
     ConnectionError(String),
     Disconnect,
     Error(String),
