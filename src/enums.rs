@@ -15,8 +15,28 @@
 use crate::utils::{ModbusReadCommand, ModbusWriteCommand};
 use crossterm::event::Event;
 use ratatui::{style::Style, text::Line};
-use std::net::SocketAddr;
+use std::{fmt, net::SocketAddr};
 use strum::{Display, EnumIter, FromRepr};
+
+pub enum LogDirection {
+    Tx,
+    Rx,
+}
+
+impl fmt::Display for LogDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LogDirection::Tx => write!(f, "TX"),
+            LogDirection::Rx => write!(f, "RX"),
+        }
+    }
+}
+
+pub struct LogEntry {
+    pub timestamp: String,
+    pub direction: LogDirection,
+    pub message: String,
+}
 
 pub enum Action {
     CEvent(Event),
@@ -25,11 +45,13 @@ pub enum Action {
     ToModbus(ModbusCommandQueue),   // From App to Modbus
     FromModbus(ModbusCommandQueue), // From Modbus to App
     SuccessfulWrite,
-    Connect(SocketAddr),
+    Connect(ConnectMode),
+    ConnectionEstablished,
     ConnectionError(String),
     Disconnect,
     Error(String),
     PageRefresh,
+    LogMessage(LogEntry),
 }
 
 pub enum ModbusCommandQueue {
@@ -135,6 +157,8 @@ pub enum SelectedBottomTab {
     Connection,
     #[strum(to_string = "Queue")]
     Queue,
+    #[strum(to_string = "Log")]
+    Log,
 }
 
 impl SelectedBottomTab {
@@ -166,7 +190,28 @@ pub enum CellState {
     Queued,
 }
 
+#[derive(Default, Clone, Copy, PartialEq, Eq, Display)]
+pub enum ConnectType {
+    #[default]
+    #[strum(to_string = "TCP")]
+    Tcp,
+    #[strum(to_string = "RTU")]
+    Rtu,
+}
+
+pub enum ConnectMode {
+    Tcp(SocketAddr),
+    Rtu {
+        port: String,
+        baud_rate: u32,
+        slave_id: u8,
+    },
+}
+
 pub enum ConnectingField {
     Address,
     Port,
+    SerialPort,
+    BaudRate,
+    SlaveId,
 }

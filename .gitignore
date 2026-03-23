@@ -36,6 +36,7 @@ logs/
 # Local environment
 .env
 .env.local
+.magic_modbus_last_connection
 
 # Cargo documentation
 /doc/

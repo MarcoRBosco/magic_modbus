@@ -31,11 +31,20 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
     #[arg(short, long, value_parser, requires = "port")]
-    /// Target address
+    /// Target address (TCP mode)
     address: Option<IpAddr>,
     #[arg(short, long, value_parser, requires = "address")]
-    /// Target port
+    /// Target port (TCP mode)
     port: Option<u16>,
+    #[arg(long, value_parser, requires_all = ["baud_rate", "slave_id"])]
+    /// Serial port for RTU mode (e.g. /dev/ttyUSB0 or COM1)
+    serial_port: Option<String>,
+    #[arg(long, value_parser, requires_all = ["serial_port", "slave_id"])]
+    /// Baud rate for RTU mode (e.g. 9600, 19200, 115200)
+    baud_rate: Option<u32>,
+    #[arg(long, value_parser, requires_all = ["serial_port", "baud_rate"])]
+    /// Slave ID for RTU mode (1-255)
+    slave_id: Option<u8>,
 }
 
 #[derive(Subcommand)]
@@ -98,7 +107,16 @@ async fn main() -> Result<()> {
         None => {
             let mut terminal = ratatui::init();
 
-            App::new().run(&mut terminal, cli.address, cli.port).await?;
+            App::new()
+                .run(
+                    &mut terminal,
+                    cli.address,
+                    cli.port,
+                    cli.serial_port,
+                    cli.baud_rate,
+                    cli.slave_id,
+                )
+                .await?;
 
             ratatui::restore();
         }
