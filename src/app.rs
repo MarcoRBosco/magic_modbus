@@ -49,14 +49,31 @@ use crate::{
     utils::{ModbusReadCommand, ModbusWriteCommand, centered_rect, trim_borders},
 };
 
-const FOOTER_TEXT: [&str; 6] = [
+const FOOTER_TEXT: [&str; 7] = [
     "(Esc) Quit | (Q) Previous Tab | (E) Next Tab | (Tab) Change Focus | (?) Help", // Main Controls
     "(W A S D) Navigate | (Space) Toggle/Edit | (Enter) Apply | (G) Go To", // Top Tab Controls
     "(← →) Select Button | (Enter) Connect/Disconnect",                     // Connection Menu
     "(↑ ↓) Navigate | (G) Go To Address | (R) Revert Item | (M) Save Macro", // Queue Menu
     "(Enter) - Close Popup",                                                // Error Popup
     "Enter address (1-65535) | (Enter) Go To Address | (Esc) Cancel",       // Goto Popup
+    "(↑ ↓) Scroll | (C) Clear Log",                                        // Log Menu
 ];
+
+fn make_log_entry(direction: LogDirection, message: String) -> Action {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let h = (secs / 3600) % 24;
+    let m = (secs / 60) % 60;
+    let s = secs % 60;
+    Action::LogMessage(LogEntry {
+        timestamp: format!("{h:02}:{m:02}:{s:02}"),
+        direction,
+        message,
+    })
+}
 
 pub struct App {
     // Main Async Event Loop
@@ -93,6 +110,11 @@ pub struct App {
     queue_table_state: TableState,
     queue_item_index: usize,
     queue_scroll_state: ScrollbarState,
+
+    // Log Tab
+    log_entries: Vec<LogEntry>,
+    log_scroll_state: ScrollbarState,
+    log_scroll_position: usize,
 
     // Connection Popup
     connect_type: ConnectType,
@@ -171,6 +193,11 @@ impl App {
             queue_table_state: TableState::new(),
             queue_item_index: 0,
             queue_scroll_state: ScrollbarState::new(1),
+
+            // Log Tab
+            log_entries: vec![],
+            log_scroll_state: ScrollbarState::new(0),
+            log_scroll_position: 0,
 
             // Connection Popup
             connect_type: ConnectType::default(),
@@ -311,6 +338,15 @@ impl App {
                     Action::SuccessfulWrite => {
                         self.table_apply_queued_cells();
                     }
+                    Action::LogMessage(entry) => {
+                        const MAX_LOG_ENTRIES: usize = 1000;
+                        self.log_entries.push(entry);
+                        if self.log_entries.len() > MAX_LOG_ENTRIES {
+                            self.log_entries.remove(0);
+                        }
+                        // Auto-scroll to the bottom
+                        self.log_scroll_position = self.log_entries.len().saturating_sub(1);
+                    }
                 },
                 None => {
                     break;
@@ -399,10 +435,22 @@ impl App {
                     ModbusCommandQueue::Read(commands) => {
                         let mut table_commands = Vec::new();
                         for (table, start, count) in commands {
+                            let _ = ui_tx
+                                .send(make_log_entry(
+                                    LogDirection::Tx,
+                                    format!("Read {} addr=0x{:04X} count={}", table, start + 1, count),
+                                ))
+                                .await;
                             match table {
                                 SelectedTopTab::Coils => match ctx.read_coils(start, count).await {
                                     Ok(tcp_result) => match tcp_result {
                                         Ok(modbus_result) => {
+                                            let _ = ui_tx
+                                                .send(make_log_entry(
+                                                    LogDirection::Rx,
+                                                    format!("{} values received", modbus_result.len()),
+                                                ))
+                                                .await;
                                             for (i, coil) in modbus_result.into_iter().enumerate() {
                                                 table_commands.push((
                                                     table,
@@ -432,6 +480,12 @@ impl App {
                                     match ctx.read_discrete_inputs(start, count).await {
                                         Ok(tcp_result) => match tcp_result {
                                             Ok(modbus_result) => {
+                                                let _ = ui_tx
+                                                    .send(make_log_entry(
+                                                        LogDirection::Rx,
+                                                        format!("{} values received", modbus_result.len()),
+                                                    ))
+                                                    .await;
                                                 for (i, coil) in
                                                     modbus_result.into_iter().enumerate()
                                                 {
@@ -464,6 +518,12 @@ impl App {
                                     match ctx.read_input_registers(start, count).await {
                                         Ok(tcp_result) => match tcp_result {
                                             Ok(modbus_result) => {
+                                                let _ = ui_tx
+                                                    .send(make_log_entry(
+                                                        LogDirection::Rx,
+                                                        format!("{} values received", modbus_result.len()),
+                                                    ))
+                                                    .await;
                                                 for (i, word) in
                                                     modbus_result.into_iter().enumerate()
                                                 {
@@ -496,6 +556,12 @@ impl App {
                                     match ctx.read_holding_registers(start, count).await {
                                         Ok(tcp_result) => match tcp_result {
                                             Ok(modbus_result) => {
+                                                let _ = ui_tx
+                                                    .send(make_log_entry(
+                                                        LogDirection::Rx,
+                                                        format!("{} values received", modbus_result.len()),
+                                                    ))
+                                                    .await;
                                                 for (i, word) in
                                                     modbus_result.into_iter().enumerate()
                                                 {
@@ -538,6 +604,12 @@ impl App {
                             let (table, addr, content) = command;
                             match (table, content) {
                                 (SelectedTopTab::Coils, CellType::Coil(b)) => {
+                                    let _ = ui_tx
+                                        .send(make_log_entry(
+                                            LogDirection::Tx,
+                                            format!("Write Single Coil addr=0x{:04X} val={}", addr + 1, b as u16),
+                                        ))
+                                        .await;
                                     if ctx.write_single_coil(addr, b).await.is_err() {
                                         let _ = ui_tx
                                             .send(Action::ConnectionError(String::from(
@@ -547,8 +619,17 @@ impl App {
                                         was_successful = false;
                                         break;
                                     }
+                                    let _ = ui_tx
+                                        .send(make_log_entry(LogDirection::Rx, String::from("OK")))
+                                        .await;
                                 }
                                 (SelectedTopTab::HoldingRegisters, CellType::Word(w)) => {
+                                    let _ = ui_tx
+                                        .send(make_log_entry(
+                                            LogDirection::Tx,
+                                            format!("Write Single Register addr=0x{:04X} val={}", addr + 1, w),
+                                        ))
+                                        .await;
                                     if ctx.write_single_register(addr, w).await.is_err() {
                                         let _ = ui_tx
                                             .send(Action::ConnectionError(String::from(
@@ -558,6 +639,9 @@ impl App {
                                         was_successful = false;
                                         break;
                                     }
+                                    let _ = ui_tx
+                                        .send(make_log_entry(LogDirection::Rx, String::from("OK")))
+                                        .await;
                                 }
                                 _ => {}
                             }
@@ -779,6 +863,19 @@ impl App {
                                                     )))
                                                     .await;
                                             }
+                                        }
+                                        _ => {}
+                                    },
+                                    SelectedBottomTab::Log => match key.code {
+                                        KeyCode::Up => {
+                                            self.log_scroll_up();
+                                        }
+                                        KeyCode::Down => {
+                                            self.log_scroll_down();
+                                        }
+                                        KeyCode::Char('c') => {
+                                            self.log_entries.clear();
+                                            self.log_scroll_position = 0;
                                         }
                                         _ => {}
                                     },
@@ -1409,6 +1506,7 @@ impl App {
             CurrentFocus::Bottom => match self.selected_bottom_tab {
                 SelectedBottomTab::Connection => FOOTER_TEXT[2],
                 SelectedBottomTab::Queue => FOOTER_TEXT[3],
+                SelectedBottomTab::Log => FOOTER_TEXT[6],
             },
         };
         let test_footer = Text::from(vec![
@@ -1460,6 +1558,7 @@ impl App {
         match self.selected_bottom_tab {
             SelectedBottomTab::Connection => self.render_connection_tab(frame, main_area),
             SelectedBottomTab::Queue => self.render_queue_tab(frame, main_area),
+            SelectedBottomTab::Log => self.render_log_tab(frame, main_area),
         }
     }
 
@@ -1591,6 +1690,69 @@ impl App {
                 Paragraph::new("No Queued Commands").block(Block::bordered().style(area_style)),
                 area,
             )
+        }
+    }
+
+    fn render_log_tab(&mut self, frame: &mut Frame, area: Rect) {
+        let area_style = match self.current_focus {
+            CurrentFocus::Top => self.colors.section_unselected_fg,
+            CurrentFocus::Bottom => self.colors.section_selected_fg,
+        };
+
+        let visible_height = area.height.saturating_sub(2) as usize;
+        let total = self.log_entries.len();
+
+        if total == 0 {
+            frame.render_widget(
+                Paragraph::new("No log entries").block(Block::bordered().style(area_style)),
+                area,
+            );
+            return;
+        }
+
+        // Clamp scroll position
+        let max_scroll = total.saturating_sub(visible_height);
+        self.log_scroll_position = self.log_scroll_position.min(max_scroll);
+
+        let start = self.log_scroll_position;
+        let end = (start + visible_height).min(total);
+
+        let lines: Vec<Line> = self.log_entries[start..end]
+            .iter()
+            .map(|entry| {
+                let (dir_style, label) = match entry.direction {
+                    LogDirection::Tx => (Style::default().fg(Color::Cyan), "TX"),
+                    LogDirection::Rx => (Style::default().fg(Color::Green), "RX"),
+                };
+                Line::from(vec![
+                    Span::styled(
+                        format!("[{}] ", entry.timestamp),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(format!("{label}: "), dir_style),
+                    Span::raw(entry.message.clone()),
+                ])
+            })
+            .collect();
+
+        self.log_scroll_state = self
+            .log_scroll_state
+            .content_length(total)
+            .position(self.log_scroll_position);
+
+        let paragraph = Paragraph::new(lines)
+            .block(Block::bordered().style(area_style));
+        frame.render_widget(paragraph, area);
+
+        if total > visible_height {
+            frame.render_stateful_widget(
+                Scrollbar::default().orientation(ScrollbarOrientation::VerticalRight),
+                area.inner(Margin {
+                    vertical: 1,
+                    horizontal: 1,
+                }),
+                &mut self.log_scroll_state,
+            );
         }
     }
 
@@ -2373,6 +2535,15 @@ impl App {
 
     fn previous_bottom_tab(&mut self) {
         self.selected_bottom_tab = self.selected_bottom_tab.previous();
+    }
+
+    fn log_scroll_up(&mut self) {
+        self.log_scroll_position = self.log_scroll_position.saturating_sub(1);
+    }
+
+    fn log_scroll_down(&mut self) {
+        let max = self.log_entries.len().saturating_sub(1);
+        self.log_scroll_position = (self.log_scroll_position + 1).min(max);
     }
 
     fn get_table_stats(&self, area: Rect) -> (usize, usize, usize, usize) {
