@@ -15,7 +15,6 @@
 use std::{
     io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    time::Duration,
 };
 
 use color_eyre::Result;
@@ -32,6 +31,7 @@ use ratatui::{
     },
 };
 use strum::IntoEnumIterator;
+use tokio::time::{Duration, timeout};
 use tokio::{
     sync::mpsc::{self, Receiver, Sender},
     task::JoinHandle,
@@ -56,7 +56,7 @@ const FOOTER_TEXT: [&str; 7] = [
     "(↑ ↓) Navigate | (G) Go To Address | (R) Revert Item | (M) Save Macro", // Queue Menu
     "(Enter) - Close Popup",                                                // Error Popup
     "Enter address (1-65535) | (Enter) Go To Address | (Esc) Cancel",       // Goto Popup
-    "(↑ ↓) Scroll | (C) Clear Log",                                        // Log Menu
+    "(↑ ↓) Scroll | (C) Clear Log",                                         // Log Menu
 ];
 
 fn make_log_entry(direction: LogDirection, message: String) -> Action {
@@ -283,7 +283,10 @@ impl App {
 
         if let (Some(addr), Some(port)) = (addr, port) {
             let socket_addr = SocketAddr::new(addr, port);
-            let _ = self.sender.send(Action::Connect(ConnectMode::Tcp(socket_addr))).await;
+            let _ = self
+                .sender
+                .send(Action::Connect(ConnectMode::Tcp(socket_addr)))
+                .await;
         } else if let (Some(rtu_port), Some(baud_rate), Some(slave_id)) =
             (rtu_port, baud_rate, slave_id)
         {
@@ -421,7 +424,8 @@ impl App {
                     baud_rate,
                     slave_id,
                 } => {
-                    let builder = tokio_serial::new(&port, baud_rate);
+                    let builder =
+                        tokio_serial::new(&port, baud_rate).timeout(Duration::from_millis(2500));
                     match SerialStream::open(&builder) {
                         Ok(serial) => rtu::attach_slave(serial, tokio_modbus::Slave(slave_id)),
                         Err(e) => {
@@ -439,7 +443,12 @@ impl App {
                             let _ = ui_tx
                                 .send(make_log_entry(
                                     LogDirection::Tx,
-                                    format!("Read {} addr=0x{:04X} count={}", table, start + 1, count),
+                                    format!(
+                                        "Read {} addr=0x{:04X} count={}",
+                                        table,
+                                        start + 1,
+                                        count
+                                    ),
                                 ))
                                 .await;
                             match table {
@@ -583,8 +592,30 @@ impl App {
                                     }
                                 }
                                 SelectedTopTab::HoldingRegisters => {
+                                    let _ = ui_tx
+                                        .send(make_log_entry(
+                                            LogDirection::Tx,
+                                            format!(
+                                                "Sending Read Holding Registers addr=0x{:04X} count={}",
+                                                start, count
+                                            ),
+                                        ))
+                                        .await;
+                                    /*match timeout(
+                                        Duration::from_millis(2500),
+                                        ctx.read_holding_registers(start, count),
+                                    )*/
                                     match ctx.read_holding_registers(start, count).await {
                                         Ok(Ok(modbus_result)) => {
+                                            let _ = ui_tx
+                                                .send(make_log_entry(
+                                                    LogDirection::Rx,
+                                                    format!(
+                                                        "Modbus Read Result: {:?}",
+                                                        modbus_result
+                                                    ),
+                                                ))
+                                                .await;
                                             let hex_vals: Vec<String> = modbus_result
                                                 .iter()
                                                 .map(|w| format!("0x{w:04X}"))
@@ -616,11 +647,11 @@ impl App {
                                                 )))
                                                 .await;
                                         }
-                                        Err(_) => {
+                                        Err(e) => {
                                             let _ = ui_tx
                                                 .send(make_log_entry(
                                                     LogDirection::Rx,
-                                                    String::from("Error: connection lost"),
+                                                    format!("Error: {e}"),
                                                 ))
                                                 .await;
                                             let _ = ui_tx
@@ -648,7 +679,11 @@ impl App {
                                     let _ = ui_tx
                                         .send(make_log_entry(
                                             LogDirection::Tx,
-                                            format!("Write Single Coil addr=0x{:04X} val={}", addr + 1, b as u16),
+                                            format!(
+                                                "Write Single Coil addr=0x{:04X} val={}",
+                                                addr + 1,
+                                                b as u16
+                                            ),
                                         ))
                                         .await;
                                     match ctx.write_single_coil(addr, b).await {
@@ -656,7 +691,11 @@ impl App {
                                             let _ = ui_tx
                                                 .send(make_log_entry(
                                                     LogDirection::Rx,
-                                                    format!("OK addr=0x{:04X} val={}", addr + 1, b as u16),
+                                                    format!(
+                                                        "OK addr=0x{:04X} val={}",
+                                                        addr + 1,
+                                                        b as u16
+                                                    ),
                                                 ))
                                                 .await;
                                         }
@@ -694,7 +733,11 @@ impl App {
                                     let _ = ui_tx
                                         .send(make_log_entry(
                                             LogDirection::Tx,
-                                            format!("Write Single Register addr=0x{:04X} val={}", addr + 1, w),
+                                            format!(
+                                                "Write Single Register addr=0x{:04X} val={}",
+                                                addr + 1,
+                                                w
+                                            ),
                                         ))
                                         .await;
                                     match ctx.write_single_register(addr, w).await {
@@ -979,10 +1022,12 @@ impl App {
                     AppMode::Help => match key.code {
                         KeyCode::Esc => self.exit = true,
                         KeyCode::Char('?') => self.app_mode = AppMode::Main,
-                        KeyCode::Tab => self.help_menu_page = match self.help_menu_page {
-                            0 => 1,
-                            _ => 0,
-                        },
+                        KeyCode::Tab => {
+                            self.help_menu_page = match self.help_menu_page {
+                                0 => 1,
+                                _ => 0,
+                            }
+                        }
                         _ => {}
                     },
                     AppMode::Popup(popup) => match popup {
@@ -1029,8 +1074,7 @@ impl App {
                                 }
                                 ConnectingField::SlaveId => {
                                     if self.slave_id_input_cursor > 0 {
-                                        self.slave_id_input
-                                            .remove(self.slave_id_input_cursor - 1);
+                                        self.slave_id_input.remove(self.slave_id_input_cursor - 1);
                                         self.slave_id_input_cursor =
                                             self.slave_id_input_cursor.saturating_sub(1);
                                     } else {
@@ -1043,11 +1087,11 @@ impl App {
                                     if self.address_input.len() < 2 || self.port_input.len() < 2 {
                                         self.beep()?;
                                     } else {
-                                        let address = (self.address_input.as_str().trim()
-                                            .to_owned()
-                                            + ":"
-                                            + self.port_input.as_str().trim())
-                                        .parse::<SocketAddr>();
+                                        let address =
+                                            (self.address_input.as_str().trim().to_owned()
+                                                + ":"
+                                                + self.port_input.as_str().trim())
+                                            .parse::<SocketAddr>();
 
                                         match address {
                                             Ok(addr) => {
@@ -1138,8 +1182,7 @@ impl App {
                                     }
                                 }
                                 ConnectingField::BaudRate => {
-                                    if self.baud_rate_input_cursor
-                                        < self.baud_rate_input.len() - 1
+                                    if self.baud_rate_input_cursor < self.baud_rate_input.len() - 1
                                     {
                                         self.baud_rate_input_cursor =
                                             self.baud_rate_input_cursor.saturating_add(1);
@@ -1237,8 +1280,7 @@ impl App {
                                 }
                                 ConnectingField::BaudRate => {
                                     if c.is_ascii_digit() {
-                                        self.baud_rate_input
-                                            .insert(self.baud_rate_input_cursor, c);
+                                        self.baud_rate_input.insert(self.baud_rate_input_cursor, c);
                                         self.baud_rate_input_cursor =
                                             self.baud_rate_input_cursor.saturating_add(1);
                                     } else {
@@ -1247,8 +1289,7 @@ impl App {
                                 }
                                 ConnectingField::SlaveId => {
                                     if c.is_ascii_digit() {
-                                        self.slave_id_input
-                                            .insert(self.slave_id_input_cursor, c);
+                                        self.slave_id_input.insert(self.slave_id_input_cursor, c);
                                         self.slave_id_input_cursor =
                                             self.slave_id_input_cursor.saturating_add(1);
                                     } else {
@@ -1478,9 +1519,11 @@ impl App {
                                 }
                                 _ => {}
                             },
-                            SaveMacroMode::FileSaved => if key.code == KeyCode::Enter {
-                                self.app_mode = AppMode::Main;
-                            },
+                            SaveMacroMode::FileSaved => {
+                                if key.code == KeyCode::Enter {
+                                    self.app_mode = AppMode::Main;
+                                }
+                            }
                         },
                     },
                 }
@@ -1687,14 +1730,12 @@ impl App {
                 Line::from(format!("Target Address: {}", address)),
                 Line::from(format!("Target Port: {}", port)),
             ]),
-            (_, _, Some(serial_port), Some(baud_rate), Some(slave_id)) => {
-                Paragraph::new(vec![
-                    Line::from(format!("Connection Status: {}", self.connection_status)),
-                    Line::from("Mode: RTU"),
-                    Line::from(format!("Serial Port: {}", serial_port)),
-                    Line::from(format!("Baud Rate: {} | Slave ID: {}", baud_rate, slave_id)),
-                ])
-            }
+            (_, _, Some(serial_port), Some(baud_rate), Some(slave_id)) => Paragraph::new(vec![
+                Line::from(format!("Connection Status: {}", self.connection_status)),
+                Line::from("Mode: RTU"),
+                Line::from(format!("Serial Port: {}", serial_port)),
+                Line::from(format!("Baud Rate: {} | Slave ID: {}", baud_rate, slave_id)),
+            ]),
             _ => Paragraph::new(vec![
                 Line::from(format!("Connection Status: {}", self.connection_status)),
                 Line::from("Mode: N/A"),
@@ -1833,8 +1874,7 @@ impl App {
             .content_length(total)
             .position(self.log_scroll_position);
 
-        let paragraph = Paragraph::new(lines)
-            .block(Block::bordered().style(area_style));
+        let paragraph = Paragraph::new(lines).block(Block::bordered().style(area_style));
         frame.render_widget(paragraph, area);
 
         if total > visible_height {
@@ -1851,18 +1891,18 @@ impl App {
 
     fn render_help_menu(&self, frame: &mut Frame, area: Rect) {
         let help_menu_block = Block::bordered()
-            .title(format!("Magic ModBus - Help Menu (Page {}/2)", self.help_menu_page + 1))
+            .title(format!(
+                "Magic ModBus - Help Menu (Page {}/2)",
+                self.help_menu_page + 1
+            ))
             .title_alignment(Alignment::Center)
             .style(self.colors.section_selected_fg);
         frame.render_widget(help_menu_block, area);
 
         let trimmed_area = trim_borders(area);
 
-        let [general_area, table_area] = Layout::vertical([
-            Constraint::Length(6),
-            Constraint::Min(8),
-        ])
-            .areas(trimmed_area);
+        let [general_area, table_area] =
+            Layout::vertical([Constraint::Length(6), Constraint::Min(8)]).areas(trimmed_area);
 
         let [connection_area, queue_area, _, help_hint_area] = Layout::vertical([
             Constraint::Length(8),
@@ -1870,7 +1910,7 @@ impl App {
             Constraint::Fill(1),
             Constraint::Length(1),
         ])
-            .areas(trimmed_area);
+        .areas(trimmed_area);
 
         // General Controls Section
         let general_help = Paragraph::new(vec![
