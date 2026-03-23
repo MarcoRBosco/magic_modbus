@@ -61,6 +61,7 @@ const FOOTER_TEXT: [&str; 7] = [
 
 fn make_log_entry(direction: LogDirection, message: String) -> Action {
     use std::time::{SystemTime, UNIX_EPOCH};
+    // Timestamp is UTC
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1710,7 +1711,7 @@ impl App {
             return;
         }
 
-        // Clamp scroll position
+        // Clamp scroll position against current total (entries may have been cleared)
         let max_scroll = total.saturating_sub(visible_height);
         self.log_scroll_position = self.log_scroll_position.min(max_scroll);
 
@@ -1730,7 +1731,7 @@ impl App {
                         Style::default().fg(Color::DarkGray),
                     ),
                     Span::styled(format!("{label}: "), dir_style),
-                    Span::raw(entry.message.clone()),
+                    Span::raw(entry.message.as_str()),
                 ])
             })
             .collect();
@@ -2542,6 +2543,9 @@ impl App {
     }
 
     fn log_scroll_down(&mut self) {
+        if self.log_entries.is_empty() {
+            return;
+        }
         let max = self.log_entries.len().saturating_sub(1);
         self.log_scroll_position = (self.log_scroll_position + 1).min(max);
     }
