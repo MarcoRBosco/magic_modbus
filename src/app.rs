@@ -444,12 +444,61 @@ impl App {
                                 .await;
                             match table {
                                 SelectedTopTab::Coils => match ctx.read_coils(start, count).await {
-                                    Ok(tcp_result) => match tcp_result {
-                                        Ok(modbus_result) => {
+                                    Ok(Ok(modbus_result)) => {
+                                        let bits: Vec<String> = modbus_result
+                                            .iter()
+                                            .map(|b| if *b { "1" } else { "0" }.to_string())
+                                            .collect();
+                                        let _ = ui_tx
+                                            .send(make_log_entry(
+                                                LogDirection::Rx,
+                                                format!("[{}]", bits.join(" ")),
+                                            ))
+                                            .await;
+                                        for (i, coil) in modbus_result.into_iter().enumerate() {
+                                            table_commands.push((
+                                                table,
+                                                start + i as u16,
+                                                CellType::Coil(coil),
+                                            ));
+                                        }
+                                    }
+                                    Ok(Err(exc)) => {
+                                        let _ = ui_tx
+                                            .send(make_log_entry(
+                                                LogDirection::Rx,
+                                                format!("Exception: {exc}"),
+                                            ))
+                                            .await;
+                                        let _ = ui_tx
+                                            .send(Action::Error(format!("Modbus Error: {exc}")))
+                                            .await;
+                                    }
+                                    Err(_) => {
+                                        let _ = ui_tx
+                                            .send(make_log_entry(
+                                                LogDirection::Rx,
+                                                String::from("Error: connection lost"),
+                                            ))
+                                            .await;
+                                        let _ = ui_tx
+                                            .send(Action::ConnectionError(String::from(
+                                                "Connection Was Lost",
+                                            )))
+                                            .await;
+                                    }
+                                },
+                                SelectedTopTab::DiscreteInputs => {
+                                    match ctx.read_discrete_inputs(start, count).await {
+                                        Ok(Ok(modbus_result)) => {
+                                            let bits: Vec<String> = modbus_result
+                                                .iter()
+                                                .map(|b| if *b { "1" } else { "0" }.to_string())
+                                                .collect();
                                             let _ = ui_tx
                                                 .send(make_log_entry(
                                                     LogDirection::Rx,
-                                                    format!("{} values received", modbus_result.len()),
+                                                    format!("[{}]", bits.join(" ")),
                                                 ))
                                                 .await;
                                             for (i, coil) in modbus_result.into_iter().enumerate() {
@@ -460,53 +509,24 @@ impl App {
                                                 ));
                                             }
                                         }
-                                        Err(modbus_err) => {
+                                        Ok(Err(exc)) => {
                                             let _ = ui_tx
-                                                .send(Action::Error(format!(
-                                                    "Modbus Error: {}",
-                                                    modbus_err
-                                                )))
+                                                .send(make_log_entry(
+                                                    LogDirection::Rx,
+                                                    format!("Exception: {exc}"),
+                                                ))
+                                                .await;
+                                            let _ = ui_tx
+                                                .send(Action::Error(format!("Modbus Error: {exc}")))
                                                 .await;
                                         }
-                                    },
-                                    Err(_) => {
-                                        let _ = ui_tx
-                                            .send(Action::ConnectionError(String::from(
-                                                "Connection Was Lost",
-                                            )))
-                                            .await;
-                                    }
-                                },
-                                SelectedTopTab::DiscreteInputs => {
-                                    match ctx.read_discrete_inputs(start, count).await {
-                                        Ok(tcp_result) => match tcp_result {
-                                            Ok(modbus_result) => {
-                                                let _ = ui_tx
-                                                    .send(make_log_entry(
-                                                        LogDirection::Rx,
-                                                        format!("{} values received", modbus_result.len()),
-                                                    ))
-                                                    .await;
-                                                for (i, coil) in
-                                                    modbus_result.into_iter().enumerate()
-                                                {
-                                                    table_commands.push((
-                                                        table,
-                                                        start + i as u16,
-                                                        CellType::Coil(coil),
-                                                    ));
-                                                }
-                                            }
-                                            Err(modbus_err) => {
-                                                let _ = ui_tx
-                                                    .send(Action::Error(format!(
-                                                        "Modbus Error: {}",
-                                                        modbus_err
-                                                    )))
-                                                    .await;
-                                            }
-                                        },
                                         Err(_) => {
+                                            let _ = ui_tx
+                                                .send(make_log_entry(
+                                                    LogDirection::Rx,
+                                                    String::from("Error: connection lost"),
+                                                ))
+                                                .await;
                                             let _ = ui_tx
                                                 .send(Action::ConnectionError(String::from(
                                                     "Connection Was Lost",
@@ -517,34 +537,43 @@ impl App {
                                 }
                                 SelectedTopTab::InputRegisters => {
                                     match ctx.read_input_registers(start, count).await {
-                                        Ok(tcp_result) => match tcp_result {
-                                            Ok(modbus_result) => {
-                                                let _ = ui_tx
-                                                    .send(make_log_entry(
-                                                        LogDirection::Rx,
-                                                        format!("{} values received", modbus_result.len()),
-                                                    ))
-                                                    .await;
-                                                for (i, word) in
-                                                    modbus_result.into_iter().enumerate()
-                                                {
-                                                    table_commands.push((
-                                                        table,
-                                                        start + i as u16,
-                                                        CellType::Word(word),
-                                                    ));
-                                                }
+                                        Ok(Ok(modbus_result)) => {
+                                            let hex_vals: Vec<String> = modbus_result
+                                                .iter()
+                                                .map(|w| format!("0x{w:04X}"))
+                                                .collect();
+                                            let _ = ui_tx
+                                                .send(make_log_entry(
+                                                    LogDirection::Rx,
+                                                    format!("[{}]", hex_vals.join(" ")),
+                                                ))
+                                                .await;
+                                            for (i, word) in modbus_result.into_iter().enumerate() {
+                                                table_commands.push((
+                                                    table,
+                                                    start + i as u16,
+                                                    CellType::Word(word),
+                                                ));
                                             }
-                                            Err(modbus_err) => {
-                                                let _ = ui_tx
-                                                    .send(Action::Error(format!(
-                                                        "Modbus Error: {}",
-                                                        modbus_err
-                                                    )))
-                                                    .await;
-                                            }
-                                        },
+                                        }
+                                        Ok(Err(exc)) => {
+                                            let _ = ui_tx
+                                                .send(make_log_entry(
+                                                    LogDirection::Rx,
+                                                    format!("Exception: {exc}"),
+                                                ))
+                                                .await;
+                                            let _ = ui_tx
+                                                .send(Action::Error(format!("Modbus Error: {exc}")))
+                                                .await;
+                                        }
                                         Err(_) => {
+                                            let _ = ui_tx
+                                                .send(make_log_entry(
+                                                    LogDirection::Rx,
+                                                    String::from("Error: connection lost"),
+                                                ))
+                                                .await;
                                             let _ = ui_tx
                                                 .send(Action::ConnectionError(String::from(
                                                     "Connection Was Lost",
@@ -555,34 +584,45 @@ impl App {
                                 }
                                 SelectedTopTab::HoldingRegisters => {
                                     match ctx.read_holding_registers(start, count).await {
-                                        Ok(tcp_result) => match tcp_result {
-                                            Ok(modbus_result) => {
-                                                let _ = ui_tx
-                                                    .send(make_log_entry(
-                                                        LogDirection::Rx,
-                                                        format!("{} values received", modbus_result.len()),
-                                                    ))
-                                                    .await;
-                                                for (i, word) in
-                                                    modbus_result.into_iter().enumerate()
-                                                {
-                                                    table_commands.push((
-                                                        table,
-                                                        start + i as u16,
-                                                        CellType::Word(word),
-                                                    ));
-                                                }
+                                        Ok(Ok(modbus_result)) => {
+                                            let hex_vals: Vec<String> = modbus_result
+                                                .iter()
+                                                .map(|w| format!("0x{w:04X}"))
+                                                .collect();
+                                            let _ = ui_tx
+                                                .send(make_log_entry(
+                                                    LogDirection::Rx,
+                                                    format!("[{}]", hex_vals.join(" ")),
+                                                ))
+                                                .await;
+                                            for (i, word) in modbus_result.into_iter().enumerate() {
+                                                table_commands.push((
+                                                    table,
+                                                    start + i as u16,
+                                                    CellType::Word(word),
+                                                ));
                                             }
-                                            Err(modbus_err) => {
-                                                let _ = ui_tx
-                                                    .send(Action::ConnectionError(format!(
-                                                        "Modbus Error: {}",
-                                                        modbus_err
-                                                    )))
-                                                    .await;
-                                            }
-                                        },
+                                        }
+                                        Ok(Err(exc)) => {
+                                            let _ = ui_tx
+                                                .send(make_log_entry(
+                                                    LogDirection::Rx,
+                                                    format!("Exception: {exc}"),
+                                                ))
+                                                .await;
+                                            let _ = ui_tx
+                                                .send(Action::ConnectionError(format!(
+                                                    "Modbus Error: {exc}",
+                                                )))
+                                                .await;
+                                        }
                                         Err(_) => {
+                                            let _ = ui_tx
+                                                .send(make_log_entry(
+                                                    LogDirection::Rx,
+                                                    String::from("Error: connection lost"),
+                                                ))
+                                                .await;
                                             let _ = ui_tx
                                                 .send(Action::ConnectionError(String::from(
                                                     "Connection Was Lost",
@@ -611,18 +651,44 @@ impl App {
                                             format!("Write Single Coil addr=0x{:04X} val={}", addr + 1, b as u16),
                                         ))
                                         .await;
-                                    if ctx.write_single_coil(addr, b).await.is_err() {
-                                        let _ = ui_tx
-                                            .send(Action::ConnectionError(String::from(
-                                                "Connection Was Lost",
-                                            )))
-                                            .await;
-                                        was_successful = false;
-                                        break;
+                                    match ctx.write_single_coil(addr, b).await {
+                                        Ok(Ok(())) => {
+                                            let _ = ui_tx
+                                                .send(make_log_entry(
+                                                    LogDirection::Rx,
+                                                    format!("OK addr=0x{:04X} val={}", addr + 1, b as u16),
+                                                ))
+                                                .await;
+                                        }
+                                        Ok(Err(exc)) => {
+                                            let _ = ui_tx
+                                                .send(make_log_entry(
+                                                    LogDirection::Rx,
+                                                    format!("Exception: {exc}"),
+                                                ))
+                                                .await;
+                                            let _ = ui_tx
+                                                .send(Action::Error(format!("Modbus Error: {exc}")))
+                                                .await;
+                                            was_successful = false;
+                                            break;
+                                        }
+                                        Err(_) => {
+                                            let _ = ui_tx
+                                                .send(make_log_entry(
+                                                    LogDirection::Rx,
+                                                    String::from("Error: connection lost"),
+                                                ))
+                                                .await;
+                                            let _ = ui_tx
+                                                .send(Action::ConnectionError(String::from(
+                                                    "Connection Was Lost",
+                                                )))
+                                                .await;
+                                            was_successful = false;
+                                            break;
+                                        }
                                     }
-                                    let _ = ui_tx
-                                        .send(make_log_entry(LogDirection::Rx, String::from("OK")))
-                                        .await;
                                 }
                                 (SelectedTopTab::HoldingRegisters, CellType::Word(w)) => {
                                     let _ = ui_tx
@@ -631,18 +697,44 @@ impl App {
                                             format!("Write Single Register addr=0x{:04X} val={}", addr + 1, w),
                                         ))
                                         .await;
-                                    if ctx.write_single_register(addr, w).await.is_err() {
-                                        let _ = ui_tx
-                                            .send(Action::ConnectionError(String::from(
-                                                "Connection Was Lost",
-                                            )))
-                                            .await;
-                                        was_successful = false;
-                                        break;
+                                    match ctx.write_single_register(addr, w).await {
+                                        Ok(Ok(())) => {
+                                            let _ = ui_tx
+                                                .send(make_log_entry(
+                                                    LogDirection::Rx,
+                                                    format!("OK addr=0x{:04X} val={}", addr + 1, w),
+                                                ))
+                                                .await;
+                                        }
+                                        Ok(Err(exc)) => {
+                                            let _ = ui_tx
+                                                .send(make_log_entry(
+                                                    LogDirection::Rx,
+                                                    format!("Exception: {exc}"),
+                                                ))
+                                                .await;
+                                            let _ = ui_tx
+                                                .send(Action::Error(format!("Modbus Error: {exc}")))
+                                                .await;
+                                            was_successful = false;
+                                            break;
+                                        }
+                                        Err(_) => {
+                                            let _ = ui_tx
+                                                .send(make_log_entry(
+                                                    LogDirection::Rx,
+                                                    String::from("Error: connection lost"),
+                                                ))
+                                                .await;
+                                            let _ = ui_tx
+                                                .send(Action::ConnectionError(String::from(
+                                                    "Connection Was Lost",
+                                                )))
+                                                .await;
+                                            was_successful = false;
+                                            break;
+                                        }
                                     }
-                                    let _ = ui_tx
-                                        .send(make_log_entry(LogDirection::Rx, String::from("OK")))
-                                        .await;
                                 }
                                 _ => {}
                             }
