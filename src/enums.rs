@@ -25,7 +25,7 @@ pub enum Action {
     ToModbus(ModbusCommandQueue),   // From App to Modbus
     FromModbus(ModbusCommandQueue), // From Modbus to App
     SuccessfulWrite,
-    Connect(SocketAddr),
+    Connect(ConnectMode),
     ConnectionError(String),
     Disconnect,
     Error(String),
@@ -166,7 +166,28 @@ pub enum CellState {
     Queued,
 }
 
+#[derive(Default, Clone, Copy, PartialEq, Eq, Display)]
+pub enum ConnectType {
+    #[default]
+    #[strum(to_string = "TCP")]
+    Tcp,
+    #[strum(to_string = "RTU")]
+    Rtu,
+}
+
+pub enum ConnectMode {
+    Tcp(SocketAddr),
+    Rtu {
+        port: String,
+        baud_rate: u32,
+        slave_id: u8,
+    },
+}
+
 pub enum ConnectingField {
     Address,
     Port,
+    SerialPort,
+    BaudRate,
+    SlaveId,
 }

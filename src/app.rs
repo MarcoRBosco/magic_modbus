@@ -36,7 +36,8 @@ use tokio::{
     sync::mpsc::{self, Receiver, Sender},
     task::JoinHandle,
 };
-use tokio_modbus::client::{Reader, Writer, tcp};
+use tokio_modbus::client::{Reader, Writer, rtu, tcp};
+use tokio_serial::SerialStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -47,8 +48,6 @@ use crate::{
     queue::QueueItem,
     utils::{ModbusReadCommand, ModbusWriteCommand, centered_rect, trim_borders},
 };
-
-const CONNECTION_POPUP_TEXT: &str = "Please Enter an IP Address and Port";
 
 const FOOTER_TEXT: [&str; 6] = [
     "(Esc) Quit | (Q) Previous Tab | (E) Next Tab | (Tab) Change Focus | (?) Help", // Main Controls
@@ -74,6 +73,9 @@ pub struct App {
     connection_status: ConnectionStatus,
     current_ip_address: Option<Ipv4Addr>,
     current_port: Option<u16>,
+    current_serial_port: Option<String>,
+    current_baud_rate: Option<u32>,
+    current_slave_id: Option<u8>,
     selected_connection_button: SelectedConnectionButton,
 
     // UI Focus
@@ -93,11 +95,18 @@ pub struct App {
     queue_scroll_state: ScrollbarState,
 
     // Connection Popup
+    connect_type: ConnectType,
     connecting_popup_field: ConnectingField,
     address_input_cursor: usize,
     address_input: String,
     port_input_cursor: usize,
     port_input: String,
+    serial_port_input_cursor: usize,
+    serial_port_input: String,
+    baud_rate_input_cursor: usize,
+    baud_rate_input: String,
+    slave_id_input_cursor: usize,
+    slave_id_input: String,
 
     // Edit Popup
     edit_popup_cursor: usize,
@@ -137,6 +146,9 @@ impl App {
             connection_status: ConnectionStatus::default(),
             current_ip_address: None,
             current_port: None,
+            current_serial_port: None,
+            current_baud_rate: None,
+            current_slave_id: None,
             selected_connection_button: SelectedConnectionButton::NewConnection,
 
             // UI Focus
@@ -161,11 +173,18 @@ impl App {
             queue_scroll_state: ScrollbarState::new(1),
 
             // Connection Popup
+            connect_type: ConnectType::default(),
             connecting_popup_field: ConnectingField::Address,
             address_input: String::from(" "),
             port_input: String::from(" "),
             address_input_cursor: 0,
             port_input_cursor: 0,
+            serial_port_input: String::from(" "),
+            serial_port_input_cursor: 0,
+            baud_rate_input: String::from(" "),
+            baud_rate_input_cursor: 0,
+            slave_id_input: String::from(" "),
+            slave_id_input_cursor: 0,
 
             // Edit Popup
             edit_popup_cursor: 0,
@@ -192,6 +211,9 @@ impl App {
         terminal: &mut DefaultTerminal,
         addr: Option<IpAddr>,
         port: Option<u16>,
+        rtu_port: Option<String>,
+        baud_rate: Option<u32>,
+        slave_id: Option<u8>,
     ) -> Result<()> {
         self.cancellation_token.cancel();
         self.cancellation_token = CancellationToken::new();
@@ -233,7 +255,18 @@ impl App {
 
         if let (Some(addr), Some(port)) = (addr, port) {
             let socket_addr = SocketAddr::new(addr, port);
-            let _ = self.sender.send(Action::Connect(socket_addr)).await;
+            let _ = self.sender.send(Action::Connect(ConnectMode::Tcp(socket_addr))).await;
+        } else if let (Some(rtu_port), Some(baud_rate), Some(slave_id)) =
+            (rtu_port, baud_rate, slave_id)
+        {
+            let _ = self
+                .sender
+                .send(Action::Connect(ConnectMode::Rtu {
+                    port: rtu_port,
+                    baud_rate,
+                    slave_id,
+                }))
+                .await;
         }
 
         while !self.exit {
@@ -256,7 +289,7 @@ impl App {
                             self.apply_modbus_updates(commands);
                         }
                     }
-                    Action::Connect(addr) => self.start_modbus_task(addr).await?,
+                    Action::Connect(mode) => self.start_modbus_task(mode).await?,
                     Action::ConnectionError(message) => {
                         self.connection_status = ConnectionStatus::NotConnected;
                         self.current_ip_address = None;
@@ -303,27 +336,62 @@ impl App {
         Ok(())
     }
 
-    async fn start_modbus_task(&mut self, addr: SocketAddr) -> Result<()> {
+    async fn start_modbus_task(&mut self, mode: ConnectMode) -> Result<()> {
         self.stop_modbus_task().await;
 
         let (tx_to_task, mut rx_from_ui) = mpsc::channel::<ModbusCommandQueue>(100);
         self.modbus_sender = tx_to_task.clone();
 
         self.connection_status = ConnectionStatus::Connected;
-        self.current_ip_address = match addr.ip() {
-            IpAddr::V4(v4) => Some(v4),
-            _ => self.current_ip_address,
-        };
-        self.current_port = Some(addr.port());
+
+        match &mode {
+            ConnectMode::Tcp(addr) => {
+                self.current_ip_address = match addr.ip() {
+                    IpAddr::V4(v4) => Some(v4),
+                    _ => self.current_ip_address,
+                };
+                self.current_port = Some(addr.port());
+                self.current_serial_port = None;
+                self.current_baud_rate = None;
+                self.current_slave_id = None;
+            }
+            ConnectMode::Rtu {
+                port,
+                baud_rate,
+                slave_id,
+            } => {
+                self.current_serial_port = Some(port.clone());
+                self.current_baud_rate = Some(*baud_rate);
+                self.current_slave_id = Some(*slave_id);
+                self.current_ip_address = None;
+                self.current_port = None;
+            }
+        }
 
         let ui_tx = self.sender.clone();
 
         self.modbus_task = Some(tokio::spawn(async move {
-            let mut ctx = match tcp::connect(addr).await {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = ui_tx.send(Action::ConnectionError(e.to_string())).await;
-                    return;
+            let mut ctx = match mode {
+                ConnectMode::Tcp(addr) => match tcp::connect(addr).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = ui_tx.send(Action::ConnectionError(e.to_string())).await;
+                        return;
+                    }
+                },
+                ConnectMode::Rtu {
+                    port,
+                    baud_rate,
+                    slave_id,
+                } => {
+                    let builder = tokio_serial::new(&port, baud_rate);
+                    match SerialStream::open(&builder) {
+                        Ok(serial) => rtu::attach_slave(serial, tokio_modbus::Slave(slave_id)),
+                        Err(e) => {
+                            let _ = ui_tx.send(Action::ConnectionError(e.to_string())).await;
+                            return;
+                        }
+                    }
                 }
             };
             while let Some(queue) = rx_from_ui.recv().await {
@@ -516,6 +584,9 @@ impl App {
         self.connection_status = ConnectionStatus::NotConnected;
         self.current_ip_address = None;
         self.current_port = None;
+        self.current_serial_port = None;
+        self.current_baud_rate = None;
+        self.current_slave_id = None;
     }
 
     async fn on_crossterm_event(&mut self, event: Event) -> Result<()> {
@@ -680,7 +751,15 @@ impl App {
                                             if let ConnectionStatus::Connected =
                                                 self.connection_status
                                             {
-                                                if !self.queue_table_data.is_empty() {
+                                                if self.current_ip_address.is_none() {
+                                                    // RTU connections are not supported in macro files
+                                                    let _ = self
+                                                        .sender
+                                                        .send(Action::Error(String::from(
+                                                            "Save macro is only available for TCP connections",
+                                                        )))
+                                                        .await;
+                                                } else if !self.queue_table_data.is_empty() {
                                                     self.app_mode = AppMode::Popup(
                                                         PopupType::SaveMacro(SaveMacroMode::Main),
                                                     );
@@ -738,34 +817,93 @@ impl App {
                                         self.beep()?;
                                     }
                                 }
-                            },
-                            KeyCode::Enter => {
-                                if self.address_input.len() < 2 || self.port_input.len() < 2 {
-                                    self.beep()?;
-                                }
-
-                                let address = (self.address_input.as_str().trim().to_owned()
-                                    + ":"
-                                    + self.port_input.as_str().trim())
-                                .parse::<SocketAddr>();
-
-                                match address {
-                                    Ok(addr) => {
-                                        self.app_mode = AppMode::Main;
-
-                                        self.address_input = String::from(" ");
-                                        self.address_input_cursor = 0;
-
-                                        self.port_input = String::from(" ");
-                                        self.port_input_cursor = 0;
-
-                                        self.connecting_popup_field = ConnectingField::Address;
-
-                                        self.sender.send(Action::Connect(addr)).await?;
+                                ConnectingField::SerialPort => {
+                                    if self.serial_port_input_cursor > 0 {
+                                        self.serial_port_input
+                                            .remove(self.serial_port_input_cursor - 1);
+                                        self.serial_port_input_cursor =
+                                            self.serial_port_input_cursor.saturating_sub(1);
+                                    } else {
+                                        self.beep()?;
                                     }
-                                    Err(_) => self.beep()?,
                                 }
-                            }
+                                ConnectingField::BaudRate => {
+                                    if self.baud_rate_input_cursor > 0 {
+                                        self.baud_rate_input
+                                            .remove(self.baud_rate_input_cursor - 1);
+                                        self.baud_rate_input_cursor =
+                                            self.baud_rate_input_cursor.saturating_sub(1);
+                                    } else {
+                                        self.beep()?;
+                                    }
+                                }
+                                ConnectingField::SlaveId => {
+                                    if self.slave_id_input_cursor > 0 {
+                                        self.slave_id_input
+                                            .remove(self.slave_id_input_cursor - 1);
+                                        self.slave_id_input_cursor =
+                                            self.slave_id_input_cursor.saturating_sub(1);
+                                    } else {
+                                        self.beep()?;
+                                    }
+                                }
+                            },
+                            KeyCode::Enter => match self.connect_type {
+                                ConnectType::Tcp => {
+                                    if self.address_input.len() < 2 || self.port_input.len() < 2 {
+                                        self.beep()?;
+                                    } else {
+                                        let address = (self.address_input.as_str().trim()
+                                            .to_owned()
+                                            + ":"
+                                            + self.port_input.as_str().trim())
+                                        .parse::<SocketAddr>();
+
+                                        match address {
+                                            Ok(addr) => {
+                                                self.app_mode = AppMode::Main;
+                                                self.address_input = String::from(" ");
+                                                self.address_input_cursor = 0;
+                                                self.port_input = String::from(" ");
+                                                self.port_input_cursor = 0;
+                                                self.connecting_popup_field =
+                                                    ConnectingField::Address;
+                                                self.sender
+                                                    .send(Action::Connect(ConnectMode::Tcp(addr)))
+                                                    .await?;
+                                            }
+                                            Err(_) => self.beep()?,
+                                        }
+                                    }
+                                }
+                                ConnectType::Rtu => {
+                                    let port = self.serial_port_input.trim().to_owned();
+                                    let baud_rate = self.baud_rate_input.trim().parse::<u32>();
+                                    let slave_id = self.slave_id_input.trim().parse::<u8>();
+
+                                    match (port.is_empty(), baud_rate, slave_id) {
+                                        (false, Ok(baud_rate), Ok(slave_id)) => {
+                                            self.app_mode = AppMode::Main;
+                                            self.serial_port_input = String::from(" ");
+                                            self.serial_port_input_cursor = 0;
+                                            self.baud_rate_input = String::from(" ");
+                                            self.baud_rate_input_cursor = 0;
+                                            self.slave_id_input = String::from(" ");
+                                            self.slave_id_input_cursor = 0;
+                                            self.connecting_popup_field =
+                                                ConnectingField::SerialPort;
+                                            self.sender
+                                                .send(Action::Connect(ConnectMode::Rtu {
+                                                    port,
+                                                    baud_rate,
+                                                    slave_id,
+                                                }))
+                                                .await?;
+                                        }
+                                        _ => self.beep()?,
+                                    }
+                                }
+                            },
                             KeyCode::Left => match self.connecting_popup_field {
                                 ConnectingField::Address => {
                                     self.address_input_cursor =
@@ -774,6 +912,18 @@ impl App {
                                 ConnectingField::Port => {
                                     self.port_input_cursor =
                                         self.port_input_cursor.saturating_sub(1)
+                                }
+                                ConnectingField::SerialPort => {
+                                    self.serial_port_input_cursor =
+                                        self.serial_port_input_cursor.saturating_sub(1)
+                                }
+                                ConnectingField::BaudRate => {
+                                    self.baud_rate_input_cursor =
+                                        self.baud_rate_input_cursor.saturating_sub(1)
+                                }
+                                ConnectingField::SlaveId => {
+                                    self.slave_id_input_cursor =
+                                        self.slave_id_input_cursor.saturating_sub(1)
                                 }
                             },
                             KeyCode::Right => match self.connecting_popup_field {
@@ -789,11 +939,40 @@ impl App {
                                             self.port_input_cursor.saturating_add(1);
                                     }
                                 }
+                                ConnectingField::SerialPort => {
+                                    if self.serial_port_input_cursor
+                                        < self.serial_port_input.len() - 1
+                                    {
+                                        self.serial_port_input_cursor =
+                                            self.serial_port_input_cursor.saturating_add(1);
+                                    }
+                                }
+                                ConnectingField::BaudRate => {
+                                    if self.baud_rate_input_cursor
+                                        < self.baud_rate_input.len() - 1
+                                    {
+                                        self.baud_rate_input_cursor =
+                                            self.baud_rate_input_cursor.saturating_add(1);
+                                    }
+                                }
+                                ConnectingField::SlaveId => {
+                                    if self.slave_id_input_cursor < self.slave_id_input.len() - 1 {
+                                        self.slave_id_input_cursor =
+                                            self.slave_id_input_cursor.saturating_add(1);
+                                    }
+                                }
                             },
                             KeyCode::Up | KeyCode::Down | KeyCode::Tab => {
-                                self.connecting_popup_field = match self.connecting_popup_field {
-                                    ConnectingField::Address => ConnectingField::Port,
-                                    ConnectingField::Port => ConnectingField::Address,
+                                self.connecting_popup_field = match self.connect_type {
+                                    ConnectType::Tcp => match self.connecting_popup_field {
+                                        ConnectingField::Address => ConnectingField::Port,
+                                        _ => ConnectingField::Address,
+                                    },
+                                    ConnectType::Rtu => match self.connecting_popup_field {
+                                        ConnectingField::SerialPort => ConnectingField::BaudRate,
+                                        ConnectingField::BaudRate => ConnectingField::SlaveId,
+                                        _ => ConnectingField::SerialPort,
+                                    },
                                 }
                             }
                             KeyCode::Delete => match self.connecting_popup_field {
@@ -805,8 +984,33 @@ impl App {
                                     }
                                 }
                                 ConnectingField::Port => {
-                                    if self.address_input_cursor < self.address_input.len() - 1 {
-                                        self.address_input.remove(self.address_input_cursor);
+                                    if self.port_input_cursor < self.port_input.len() - 1 {
+                                        self.port_input.remove(self.port_input_cursor);
+                                    } else {
+                                        self.beep()?;
+                                    }
+                                }
+                                ConnectingField::SerialPort => {
+                                    if self.serial_port_input_cursor
+                                        < self.serial_port_input.len() - 1
+                                    {
+                                        self.serial_port_input
+                                            .remove(self.serial_port_input_cursor);
+                                    } else {
+                                        self.beep()?;
+                                    }
+                                }
+                                ConnectingField::BaudRate => {
+                                    if self.baud_rate_input_cursor < self.baud_rate_input.len() - 1
+                                    {
+                                        self.baud_rate_input.remove(self.baud_rate_input_cursor);
+                                    } else {
+                                        self.beep()?;
+                                    }
+                                }
+                                ConnectingField::SlaveId => {
+                                    if self.slave_id_input_cursor < self.slave_id_input.len() - 1 {
+                                        self.slave_id_input.remove(self.slave_id_input_cursor);
                                     } else {
                                         self.beep()?;
                                     }
@@ -831,7 +1035,50 @@ impl App {
                                         self.beep()?;
                                     }
                                 }
+                                ConnectingField::SerialPort => {
+                                    if self.is_serial_port_char(c) {
+                                        self.serial_port_input
+                                            .insert(self.serial_port_input_cursor, c);
+                                        self.serial_port_input_cursor =
+                                            self.serial_port_input_cursor.saturating_add(1);
+                                    } else {
+                                        self.beep()?;
+                                    }
+                                }
+                                ConnectingField::BaudRate => {
+                                    if c.is_ascii_digit() {
+                                        self.baud_rate_input
+                                            .insert(self.baud_rate_input_cursor, c);
+                                        self.baud_rate_input_cursor =
+                                            self.baud_rate_input_cursor.saturating_add(1);
+                                    } else {
+                                        self.beep()?;
+                                    }
+                                }
+                                ConnectingField::SlaveId => {
+                                    if c.is_ascii_digit() {
+                                        self.slave_id_input
+                                            .insert(self.slave_id_input_cursor, c);
+                                        self.slave_id_input_cursor =
+                                            self.slave_id_input_cursor.saturating_add(1);
+                                    } else {
+                                        self.beep()?;
+                                    }
+                                }
                             },
+                            // Toggle between TCP and RTU mode with F1/F2 or with Shift+Tab
+                            KeyCode::F(1) => {
+                                if self.connect_type != ConnectType::Tcp {
+                                    self.connect_type = ConnectType::Tcp;
+                                    self.connecting_popup_field = ConnectingField::Address;
+                                }
+                            }
+                            KeyCode::F(2) => {
+                                if self.connect_type != ConnectType::Rtu {
+                                    self.connect_type = ConnectType::Rtu;
+                                    self.connecting_popup_field = ConnectingField::SerialPort;
+                                }
+                            }
                             _ => {}
                         },
                         PopupType::Edit => match key.code {
@@ -1105,10 +1352,11 @@ impl App {
     }
 
     fn render_header(&self, frame: &mut Frame, header_area: Rect) {
+        // 36 chars is enough for: "RTU /dev/ttyUSB0 (ID:255) | 0x4FFFF"
         let [title_version_area, _, address_area] = Layout::horizontal([
             Constraint::Length(22),
             Constraint::Fill(1),
-            Constraint::Length(32),
+            Constraint::Length(36),
         ])
         .areas(header_area);
 
@@ -1128,18 +1376,24 @@ impl App {
             SelectedTopTab::HoldingRegisters => format!("0x4{:04X}", table.table_address + 1),
         };
 
-        let ip_section_style = match self.connection_status {
+        let connection_style = match self.connection_status {
             ConnectionStatus::Connected => self.colors.connection_connected_fg,
             ConnectionStatus::NotConnected => self.colors.connection_not_selected_fg,
         };
 
-        let ip_section_content = match (self.current_ip_address, self.current_port) {
-            (Some(address), Some(port)) => format!("{}:{}", address, port),
+        let connection_content = match (
+            self.current_ip_address,
+            self.current_port,
+            &self.current_serial_port,
+            self.current_slave_id,
+        ) {
+            (Some(address), Some(port), _, _) => format!("{}:{}", address, port),
+            (_, _, Some(port), Some(slave_id)) => format!("RTU {} (ID:{})", port, slave_id),
             _ => String::from("Not Connected!"),
         };
 
         let ip_cell_address = Line::from(vec![
-            Span::styled(ip_section_content, ip_section_style),
+            Span::styled(connection_content, connection_style),
             Span::raw(" | "),
             Span::styled(memory_address, Style::default()),
         ])
@@ -1228,21 +1482,33 @@ impl App {
             Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .areas(buttons_area);
 
-        let address = match self.current_ip_address {
-            None => String::from("N\\A"),
-            Some(addr) => addr.to_string(),
+        let connection_stats = match (
+            self.current_ip_address,
+            self.current_port,
+            &self.current_serial_port,
+            self.current_baud_rate,
+            self.current_slave_id,
+        ) {
+            (Some(address), Some(port), _, _, _) => Paragraph::new(vec![
+                Line::from(format!("Connection Status: {}", self.connection_status)),
+                Line::from("Mode: TCP"),
+                Line::from(format!("Target Address: {}", address)),
+                Line::from(format!("Target Port: {}", port)),
+            ]),
+            (_, _, Some(serial_port), Some(baud_rate), Some(slave_id)) => {
+                Paragraph::new(vec![
+                    Line::from(format!("Connection Status: {}", self.connection_status)),
+                    Line::from("Mode: RTU"),
+                    Line::from(format!("Serial Port: {}", serial_port)),
+                    Line::from(format!("Baud Rate: {} | Slave ID: {}", baud_rate, slave_id)),
+                ])
+            }
+            _ => Paragraph::new(vec![
+                Line::from(format!("Connection Status: {}", self.connection_status)),
+                Line::from("Mode: N/A"),
+                Line::from("Target: N/A"),
+            ]),
         };
-
-        let port = match self.current_port {
-            None => String::from("N\\A"),
-            Some(port) => port.to_string(),
-        };
-
-        let connection_stats = Paragraph::new(vec![
-            Line::from(format!("Connection Status: {}", self.connection_status)),
-            Line::from(format!("Target Address: {}", address)),
-            Line::from(format!("Target Port: {}", port)),
-        ]);
 
         let connection_button = Paragraph::new(vec![
             Line::from("New Connection")
@@ -1444,7 +1710,14 @@ impl App {
             ]),
             Line::raw(""),
             Line::from("In Connection Popup:"),
-            Line::from("• Enter IP address and port"),
+            Line::from(vec![
+                Span::styled("F1", Style::default().bold()),
+                Span::raw(" / "),
+                Span::styled("F2", Style::default().bold()),
+                Span::raw(" - Switch between TCP / RTU mode"),
+            ]),
+            Line::from("• TCP: Enter IP address and port"),
+            Line::from("• RTU: Enter serial port, baud rate, slave ID"),
             Line::from("• Use UP/DOWN/TAB to switch fields"),
         ])
         .block(
@@ -1590,67 +1863,175 @@ impl App {
             CurrentFocus::Bottom => self.colors.section_selected_fg,
         };
 
-        let area = centered_rect(CONNECTION_POPUP_TEXT.len() as u16 + 2, 6, popup_area);
+        let popup_width = 46u16;
+        let popup_height = match self.connect_type {
+            ConnectType::Tcp => 7u16,
+            ConnectType::Rtu => 8u16,
+        };
+
+        let area = centered_rect(popup_width, popup_height, popup_area);
         frame.render_widget(Clear, area);
         frame.render_widget(Block::bordered().style(area_style), area);
 
-        let (address_cursor_style, address_field_style) = match self.connecting_popup_field {
-            ConnectingField::Address => (
-                Style::from(area_style).add_modifier(Modifier::REVERSED),
-                Style::from(area_style).add_modifier(Modifier::UNDERLINED),
-            ),
-            ConnectingField::Port => (Style::from(area_style), Style::from(area_style)),
-        };
-
-        let (port_cursor_style, port_field_style) = match self.connecting_popup_field {
-            ConnectingField::Address => (Style::from(area_style), Style::from(area_style)),
-            ConnectingField::Port => (
-                Style::from(area_style).add_modifier(Modifier::REVERSED),
-                Style::from(area_style).add_modifier(Modifier::UNDERLINED),
-            ),
-        };
-
-        // Refit the area to account for the borders
         let trimmed_area = trim_borders(area);
-        let address_line = Line::from(vec![
-            Span::styled("Address:", address_field_style),
-            Span::raw(" "),
-            Span::from(&self.address_input[..self.address_input_cursor]),
+
+        // Helper to build a field cursor style
+        let active_cursor = Style::from(area_style).add_modifier(Modifier::REVERSED);
+        let active_field = Style::from(area_style).add_modifier(Modifier::UNDERLINED);
+        let inactive = Style::from(area_style);
+
+        let type_line = Line::from(vec![
+            Span::raw("Mode: "),
             Span::styled(
-                format!(
-                    "{}",
-                    &self
-                        .address_input
-                        .chars()
-                        .nth(self.address_input_cursor)
-                        .unwrap()
-                ),
-                address_cursor_style,
+                "TCP",
+                if self.connect_type == ConnectType::Tcp {
+                    active_field
+                } else {
+                    inactive
+                },
             ),
-            Span::from(&self.address_input[(self.address_input_cursor + 1)..]),
-        ]);
-        let port_line = Line::from(vec![
-            Span::raw("   "),
-            Span::styled("Port:", port_field_style),
-            Span::raw(" "),
-            Span::from(&self.port_input[..self.port_input_cursor]),
+            Span::raw(" / "),
             Span::styled(
-                format!(
-                    "{}",
-                    &self.port_input.chars().nth(self.port_input_cursor).unwrap()
-                ),
-                port_cursor_style,
+                "RTU",
+                if self.connect_type == ConnectType::Rtu {
+                    active_field
+                } else {
+                    inactive
+                },
             ),
-            Span::from(&self.port_input[(self.port_input_cursor + 1)..]),
+            Span::raw("  [F1=TCP | F2=RTU]"),
         ]);
 
-        let popup_content = Paragraph::new(vec![
-            Line::from(CONNECTION_POPUP_TEXT),
-            Line::from("-".repeat(CONNECTION_POPUP_TEXT.len())),
-            address_line,
-            port_line,
-        ])
-        .style(area_style);
+        let separator = Line::from("-".repeat(popup_width as usize - 2));
+
+        let popup_content = match self.connect_type {
+            ConnectType::Tcp => {
+                let (addr_cursor_style, addr_field_style) =
+                    if matches!(self.connecting_popup_field, ConnectingField::Address) {
+                        (active_cursor, active_field)
+                    } else {
+                        (inactive, inactive)
+                    };
+                let (port_cursor_style, port_field_style) =
+                    if matches!(self.connecting_popup_field, ConnectingField::Port) {
+                        (active_cursor, active_field)
+                    } else {
+                        (inactive, inactive)
+                    };
+
+                let address_line = Line::from(vec![
+                    Span::styled("Address:", addr_field_style),
+                    Span::raw(" "),
+                    Span::from(&self.address_input[..self.address_input_cursor]),
+                    Span::styled(
+                        self.address_input
+                            .chars()
+                            .nth(self.address_input_cursor)
+                            .unwrap()
+                            .to_string(),
+                        addr_cursor_style,
+                    ),
+                    Span::from(&self.address_input[(self.address_input_cursor + 1)..]),
+                ]);
+                let port_line = Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled("Port:", port_field_style),
+                    Span::raw(" "),
+                    Span::from(&self.port_input[..self.port_input_cursor]),
+                    Span::styled(
+                        self.port_input
+                            .chars()
+                            .nth(self.port_input_cursor)
+                            .unwrap()
+                            .to_string(),
+                        port_cursor_style,
+                    ),
+                    Span::from(&self.port_input[(self.port_input_cursor + 1)..]),
+                ]);
+
+                Paragraph::new(vec![
+                    Line::from("Connect via Modbus TCP"),
+                    separator,
+                    type_line,
+                    address_line,
+                    port_line,
+                ])
+                .style(area_style)
+            }
+            ConnectType::Rtu => {
+                let (sport_cursor_style, sport_field_style) =
+                    if matches!(self.connecting_popup_field, ConnectingField::SerialPort) {
+                        (active_cursor, active_field)
+                    } else {
+                        (inactive, inactive)
+                    };
+                let (baud_cursor_style, baud_field_style) =
+                    if matches!(self.connecting_popup_field, ConnectingField::BaudRate) {
+                        (active_cursor, active_field)
+                    } else {
+                        (inactive, inactive)
+                    };
+                let (slave_cursor_style, slave_field_style) =
+                    if matches!(self.connecting_popup_field, ConnectingField::SlaveId) {
+                        (active_cursor, active_field)
+                    } else {
+                        (inactive, inactive)
+                    };
+
+                let sport_line = Line::from(vec![
+                    Span::styled("Port:", sport_field_style),
+                    Span::raw(" "),
+                    Span::from(&self.serial_port_input[..self.serial_port_input_cursor]),
+                    Span::styled(
+                        self.serial_port_input
+                            .chars()
+                            .nth(self.serial_port_input_cursor)
+                            .unwrap()
+                            .to_string(),
+                        sport_cursor_style,
+                    ),
+                    Span::from(&self.serial_port_input[(self.serial_port_input_cursor + 1)..]),
+                ]);
+                let baud_line = Line::from(vec![
+                    Span::styled("Baud:", baud_field_style),
+                    Span::raw(" "),
+                    Span::from(&self.baud_rate_input[..self.baud_rate_input_cursor]),
+                    Span::styled(
+                        self.baud_rate_input
+                            .chars()
+                            .nth(self.baud_rate_input_cursor)
+                            .unwrap()
+                            .to_string(),
+                        baud_cursor_style,
+                    ),
+                    Span::from(&self.baud_rate_input[(self.baud_rate_input_cursor + 1)..]),
+                ]);
+                let slave_line = Line::from(vec![
+                    Span::styled("Slave ID:", slave_field_style),
+                    Span::raw(" "),
+                    Span::from(&self.slave_id_input[..self.slave_id_input_cursor]),
+                    Span::styled(
+                        self.slave_id_input
+                            .chars()
+                            .nth(self.slave_id_input_cursor)
+                            .unwrap()
+                            .to_string(),
+                        slave_cursor_style,
+                    ),
+                    Span::from(&self.slave_id_input[(self.slave_id_input_cursor + 1)..]),
+                ]);
+
+                Paragraph::new(vec![
+                    Line::from("Connect via Modbus RTU (Serial)"),
+                    separator,
+                    type_line,
+                    sport_line,
+                    baud_line,
+                    slave_line,
+                ])
+                .style(area_style)
+            }
+        };
 
         frame.render_widget(popup_content, trimmed_area);
     }
@@ -2021,5 +2402,10 @@ impl App {
 
     fn is_address_char(&self, c: char) -> bool {
         matches!(c, 'A'..='F' | 'a'..='f' | '0'..='9' | '.' | ':' | '[' | ']' | '%')
+    }
+
+    fn is_serial_port_char(&self, c: char) -> bool {
+        // Allow characters valid in serial port paths (e.g. /dev/ttyUSB0 on Linux, COM1 on Windows)
+        matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '/' | '.' | '_' | '-' | '\\')
     }
 }
