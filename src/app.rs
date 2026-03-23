@@ -2382,8 +2382,8 @@ impl App {
         let popup_content = Paragraph::new(vec![
             Line::raw(" Seek to an address (1-65535) "),
             Line::from(vec![
-                Span::styled(&self.edit_popup_input[..self.edit_popup_cursor], text_style),
-                Span::styled(" ".repeat(5 - self.edit_popup_cursor), text_style),
+                Span::styled(&self.goto_popup_input[..self.goto_popup_cursor], text_style),
+                Span::styled(" ".repeat(5 - self.goto_popup_cursor), text_style),
             ])
             .centered(),
         ])
